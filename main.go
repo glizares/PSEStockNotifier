@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"net/smtp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -14,6 +18,7 @@ import (
 
 //StockData contains stock data from the stock table
 type StockData struct {
+	Symbol          string
 	LastTradedPrice float64
 	Change          string
 	ChangeUp        bool
@@ -23,11 +28,20 @@ type StockData struct {
 	Volume          string
 	High52          float64
 	Open            float64
+	PrevClosePrice  float64
 	High            float64
 	Low             float64
 	Average         float64
 	Low52           float64
 	PrevCloseDate   string
+}
+
+//StockInfo contains data retrieved from search stock symbol call
+type StockInfo struct {
+	CmpyID int    `json:"cmpyId,string"`
+	CmpyNm string `json:"cmpyNm"`
+	Symbol string `json:"symbol"`
+	EtfYn  int    `json:"etfYn,string"`
 }
 
 func httpGetRequest(requestURL string) (body string, err error) {
@@ -58,7 +72,8 @@ func trimDuplicateSpaces(str string) (trimmedString string) {
 	}
 	return trimmedString
 }
-func parseStockData(table *colly.HTMLElement) (stock StockData, err error) {
+func parseStockData(symbol string, table *colly.HTMLElement) (stock StockData, err error) {
+	stock.Symbol = symbol
 	table.DOM.Find("th").Each(func(index int, item *goquery.Selection) {
 		itemHead := string(trimDuplicateSpaces(item.Text()))
 		itemVal := string(trimDuplicateSpaces(item.Next().Text()))
@@ -69,6 +84,7 @@ func parseStockData(table *colly.HTMLElement) (stock StockData, err error) {
 			stock.Open, err = strconv.ParseFloat(itemVal, 64)
 		case "Previous Close and Date":
 			stock.PrevCloseDate = itemVal
+			stock.PrevClosePrice, err = strconv.ParseFloat(string(strings.Split(itemVal, " ")[0]), 64)
 		case "Change(% Change)":
 			stock.Change = itemVal
 			changeSeparated := strings.Split(itemVal, " ")
@@ -103,7 +119,16 @@ func parseStockData(table *colly.HTMLElement) (stock StockData, err error) {
 	})
 	return stock, err
 }
-func getStockData(companyID int) (stockData StockData, err error) {
+func getStockData(symbol string) (stockData StockData, err error) {
+
+	stockInfo, err := findStockInfo(symbol)
+	if err != nil {
+		return stockData, err
+	}
+	if len(stockInfo) != 1 {
+		return stockData, errors.New("Symbol invalid")
+	}
+	companyID := stockInfo[0].CmpyID
 	pseEdgeURL := "http://edge.pse.com.ph"
 	companyURL := fmt.Sprintf("%s/companyPage/stockData.do?cmpy_id=%d", pseEdgeURL, companyID)
 
@@ -113,28 +138,78 @@ func getStockData(companyID int) (stockData StockData, err error) {
 	scraper.OnHTML("table", func(tableElement *colly.HTMLElement) {
 		firstRowAndCol := tableElement.DOM.Find("tr").Children().First().Text()
 		if strings.Contains(firstRowAndCol, "Last Traded Price") {
-			stockData, err = parseStockData(tableElement)
+			stockData, err = parseStockData(symbol, tableElement)
 		}
 	})
 	scraper.Visit(companyURL)
 	return stockData, err
 }
-func findStockInfo(symbol string) (companyID int, err error) {
+func findStockInfo(symbol string) (stockInfo []StockInfo, err error) {
 	symbol = strings.ToUpper(symbol)
 	requestURL := fmt.Sprintf("http://edge.pse.com.ph/autoComplete/searchCompanyNameSymbol.ax?term=%s", symbol)
-	data, err := httpGetRequest(requestURL) 
+	data, err := httpGetRequest(requestURL)
 	if err != nil {
-		return -1, nil
+		return nil, err
 	}
-	
-	fmt.Println(data)
-	return -1,nil
+	err = json.Unmarshal([]byte(data), &stockInfo)
+	if err != nil {
+		return nil, err
+	}
+	return stockInfo, nil
+}
+func notifyStockDataWatcher(watcher string, stockData StockData) (err error) {
+	subject := fmt.Sprintf("PSE Notifier: %s is at target price %f", stockData.Symbol, stockData.LastTradedPrice)
+
+	body := fmt.Sprintf("Symbol: %s\n", stockData.Symbol)
+	body += fmt.Sprintf("Last Traded Price: %f\n", stockData.LastTradedPrice)
+	body += fmt.Sprintf("Change: %s\n", stockData.Change)
+	body += fmt.Sprintf("Open: %f\n", stockData.Open)
+	body += fmt.Sprintf("Close: %f\n", stockData.PrevClosePrice)
+	body += fmt.Sprintf("High: %f\n", stockData.High)
+	body += fmt.Sprintf("Low: %f\n", stockData.Low)
+	body += fmt.Sprintf("Average: %f\n", stockData.Average)
+	body += fmt.Sprintf("Value: %s\n", stockData.Value)
+	body += fmt.Sprintf("Volume: %s\n", stockData.Volume)
+	body += fmt.Sprintf("52-Week High: %f\n", stockData.High52)
+	body += fmt.Sprintf("52-Week Low: %f\n", stockData.Low52)
+	_, err = sendEmail(watcher, subject, body)
+	return err
+
+}
+func sendEmail(recipient string, subject string, body string) (string, error) {
+	from := "replace_me@gmail.com"
+	pass := "replace_me_apptoken"
+	to := recipient
+
+	msg := "From: " + from + "\n" +
+		"To: " + to + "\n" +
+		"Subject: " + subject + "\n\n" +
+		body
+
+	err := smtp.SendMail("smtp.gmail.com:587",
+		smtp.PlainAuth("", from, pass, "smtp.gmail.com"),
+		from, []string{to}, []byte(msg))
+
+	if err != nil {
+		log.Printf("smtp error: %s", err)
+		return "error", err
+	}
+	return "Sent Email", nil
+
 }
 func main() {
-	findStockInfo("st")
-	stock, err := getStockData(222)
+	stockInfo, err := findStockInfo("sti")
 	if err != nil {
 		fmt.Println(err)
 	}
-	fmt.Printf("%+v\n", stock)
+	if len(stockInfo) == 1 {
+		stockData, err := getStockData(stockInfo[0].Symbol)
+		if err != nil {
+			fmt.Println(err)
+		}
+		err = notifyStockDataWatcher("replace_me@gmail.com", stockData)
+		if err != nil {
+			fmt.Println(err)
+		}
+	}
 }
